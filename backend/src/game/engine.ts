@@ -40,6 +40,12 @@ type GameLog = { ts: number; text: string };
 
 type PendingDiscards = Record<string, number>;
 
+type TradeOffer = {
+  authorId: string;
+  offer: Partial<ResourceBank>;
+  request: Partial<ResourceBank>;
+};
+
 type RoomState = {
   id: string;
   started: boolean;
@@ -53,12 +59,14 @@ type RoomState = {
   pendingDiscards: PendingDiscards;
   pendingRobber: boolean;
   pendingSetupPlacement: { userId: string; vertexId: number } | null;
+  pendingTrade: TradeOffer | null;
   robberTileId: number;
   longestRoadHolder: string | null;
   largestArmyHolder: string | null;
   winnerId: string | null;
   lastRoll: { die1: number; die2: number; total: number } | null;
   board: Board;
+  resourceBank: ResourceBank;
   buildings: Record<number, { ownerId: string; kind: "settlement" | "city" }>;
   roads: Record<number, { ownerId: string }>;
   log: GameLog[];
@@ -82,6 +90,16 @@ function emptyDevCards(): DevBank {
     yearOfPlenty: 0,
     monopoly: 0,
     victoryPoint: 0,
+  };
+}
+
+function fullResourceBank(): ResourceBank {
+  return {
+    wood: 19,
+    brick: 19,
+    sheep: 19,
+    wheat: 19,
+    ore: 19,
   };
 }
 
@@ -122,12 +140,14 @@ function createLobbyState(roomId: string): RoomState {
     pendingDiscards: {},
     pendingRobber: false,
     pendingSetupPlacement: null,
+    pendingTrade: null,
     robberTileId: desert ? desert.id : 0,
     longestRoadHolder: null,
     largestArmyHolder: null,
     winnerId: null,
     lastRoll: null,
     board,
+    resourceBank: fullResourceBank(),
     buildings: {},
     roads: {},
     log: [],
@@ -206,11 +226,13 @@ function startGame(state: RoomState, actingUserId: string): ActionResult {
   nextState.pendingDiscards = {};
   nextState.pendingRobber = false;
   nextState.pendingSetupPlacement = null;
+  nextState.pendingTrade = null;
   nextState.longestRoadHolder = null;
   nextState.largestArmyHolder = null;
   nextState.winnerId = null;
   nextState.lastRoll = null;
   nextState.devDeck = createDevDeck();
+  nextState.resourceBank = fullResourceBank();
   nextState.buildings = {};
   nextState.roads = {};
 
@@ -243,6 +265,7 @@ function endGame(state: RoomState): ActionResult {
   }));
   nextState.playerOrder = nextState.players.map((player) => player.id);
   nextState.lastRoll = null;
+  nextState.resourceBank = fullResourceBank();
   pushLog(nextState, "Game ended. Back in lobby.");
   return { ok: true, state: nextState };
 }
@@ -266,6 +289,10 @@ function hasNeighborBuilding(state: RoomState, vertexId: number): boolean {
   return vertex.adjacentVertices.some((neighborId) => !!state.buildings[neighborId]);
 }
 
+function isBlockedRoadVertex(state: RoomState, userId: string, vertexId: number): boolean {
+  return !!state.buildings[vertexId] && state.buildings[vertexId]?.ownerId !== userId;
+}
+
 function canPlaceRoad(state: RoomState, userId: string, edgeId: number): boolean {
   if (state.roads[edgeId]) return false;
   const edge = state.board.edges[edgeId]!;
@@ -273,9 +300,10 @@ function canPlaceRoad(state: RoomState, userId: string, edgeId: number): boolean
   const touchOwnBuilding = [edge.v1, edge.v2].some((vertexId) => state.buildings[vertexId]?.ownerId === userId);
   if (touchOwnBuilding) return true;
 
-  const touchOwnRoad = [edge.v1, edge.v2].some((vertexId) =>
-    state.board.vertices[vertexId]!.adjacentEdges.some((candidateEdgeId) => state.roads[candidateEdgeId]?.ownerId === userId),
-  );
+  const touchOwnRoad = [edge.v1, edge.v2].some((vertexId) => {
+    if (isBlockedRoadVertex(state, userId, vertexId)) return false;
+    return state.board.vertices[vertexId]!.adjacentEdges.some((candidateEdgeId) => state.roads[candidateEdgeId]?.ownerId === userId);
+  });
 
   return touchOwnRoad;
 }
@@ -297,6 +325,22 @@ function gainResource(resources: ResourceBank, resource: Resource, amount: numbe
   resources[resource] += amount;
 }
 
+function hasBankResources(bank: ResourceBank, cost: Partial<ResourceBank>): boolean {
+  return (Object.keys(cost) as Resource[]).every((resource) => (bank[resource] || 0) >= (cost[resource] || 0));
+}
+
+function spendBankResources(bank: ResourceBank, cost: Partial<ResourceBank>): void {
+  for (const resource of Object.keys(cost) as Resource[]) {
+    bank[resource] -= cost[resource] || 0;
+  }
+}
+
+function gainBankResources(bank: ResourceBank, gain: Partial<ResourceBank>): void {
+  for (const resource of Object.keys(gain) as Resource[]) {
+    bank[resource] += gain[resource] || 0;
+  }
+}
+
 function distributeResourcesForRoll(state: RoomState, roll: number): void {
   if (roll === 7) return;
 
@@ -307,6 +351,8 @@ function distributeResourcesForRoll(state: RoomState, roll: number): void {
     const resource = terrainToResource(tile.terrain as any) as Resource | null;
     if (!resource) continue;
 
+    const recipients: Array<{ owner: PlayerState; amount: number }> = [];
+
     for (const vertexId of tile.vertexIds) {
       const building = state.buildings[vertexId];
       if (!building) continue;
@@ -314,7 +360,19 @@ function distributeResourcesForRoll(state: RoomState, roll: number): void {
       if (!owner) continue;
 
       const amount = building.kind === "city" ? 2 : 1;
-      gainResource(owner.resources, resource, amount);
+      recipients.push({ owner, amount });
+    }
+
+    const totalNeeded = recipients.reduce((sum, entry) => sum + entry.amount, 0);
+    if (totalNeeded === 0) continue;
+    if (!hasBankResources(state.resourceBank, { [resource]: totalNeeded })) {
+      pushLog(state, `Bank ran out of ${resource}. No ${resource} was distributed.`);
+      continue;
+    }
+
+    spendBankResources(state.resourceBank, { [resource]: totalNeeded });
+    for (const entry of recipients) {
+      gainResource(entry.owner.resources, resource, entry.amount);
     }
   }
 }
@@ -442,6 +500,16 @@ function getVictoryPoints(state: RoomState, playerId: string): number {
   return points;
 }
 
+function getPublicVictoryPoints(state: RoomState, playerId: string): number {
+  const player = getPlayer(state, playerId);
+  if (!player) return 0;
+  // Public VP includes settlements, cities and public awards (longest road, largest army)
+  let points = player.settlements.length + player.cities.length * 2;
+  if (state.longestRoadHolder === playerId) points += 2;
+  if (state.largestArmyHolder === playerId) points += 2;
+  return points;
+}
+
 function checkWinner(state: RoomState): void {
   for (const player of state.players) {
     const points = getVictoryPoints(state, player.id);
@@ -548,6 +616,11 @@ function setupPlaceRoad(state: RoomState, userId: string, edgeId: number): Actio
       const tile = next.board.tiles[tileId]!;
       const resource = terrainToResource(tile.terrain as any) as Resource | null;
       if (resource) {
+        if (!hasBankResources(next.resourceBank, { [resource]: 1 })) {
+          pushLog(next, `Bank ran out of ${resource}. No starting resource was distributed.`);
+          continue;
+        }
+        spendBankResources(next.resourceBank, { [resource]: 1 });
         gainResource(acting.resources, resource, 1);
       }
     }
@@ -600,8 +673,11 @@ function rollDice(state: RoomState, userId: string): ActionResult {
     }
     if (Object.keys(next.pendingDiscards).length === 0) {
       next.pendingRobber = true;
+      pushLog(next, `${active.username} rolled 7. ${active.username} is robbing someone.`);
+    } else {
+      const waitingNames = next.players.filter((player) => next.pendingDiscards[player.id]).map((player) => player.username);
+      pushLog(next, `${active.username} rolled 7. Waiting to discard: ${waitingNames.join(", ")}.`);
     }
-    pushLog(next, `${active.username} rolled 7. Robber activated.`);
   } else {
     distributeResourcesForRoll(next, roll);
     pushLog(next, `${active.username} rolled ${roll}. Resources distributed.`);
@@ -637,12 +713,16 @@ function discardResources(state: RoomState, userId: string, discard: Partial<Res
   for (const resource of Object.keys(discard) as Resource[]) {
     player.resources[resource] -= discard[resource] || 0;
   }
+  gainBankResources(next.resourceBank, discard);
 
   delete next.pendingDiscards[userId];
-  pushLog(next, `${player.username} discarded cards due to robber.`);
+  const waitingNames = next.players.filter((pendingPlayer) => next.pendingDiscards[pendingPlayer.id]).map((pendingPlayer) => pendingPlayer.username);
+  pushLog(next, `${player.username} discarded cards due to robber. Waiting to discard: ${waitingNames.length > 0 ? waitingNames.join(", ") : "none"}.`);
 
   if (Object.keys(next.pendingDiscards).length === 0) {
     next.pendingRobber = true;
+    const activePlayer = getActivePlayer(next);
+    pushLog(next, `${activePlayer.username} is robbing someone.`);
   }
 
   return { ok: true, state: next };
@@ -681,7 +761,7 @@ function moveRobber(state: RoomState, userId: string, tileId: number, targetPlay
       }
     }
   } else {
-    pushLog(next, `${actor.username} moved robber.`);
+    pushLog(next, `${actor.username} is robbing someone.`);
   }
 
   return { ok: true, state: next };
@@ -720,6 +800,7 @@ function buildRoad(state: RoomState, userId: string, edgeId: number, freeBuild?:
       return { ok: false, state, error: "not enough resources" };
     }
     spendResources(player.resources, cost);
+    gainBankResources(next.resourceBank, cost);
   }
 
   next.roads[edgeId] = { ownerId: userId };
@@ -755,6 +836,7 @@ function buildSettlement(state: RoomState, userId: string, vertexId: number): Ac
   }
 
   spendResources(player.resources, cost);
+  gainBankResources(next.resourceBank, cost);
   next.buildings[vertexId] = { ownerId: userId, kind: "settlement" };
   player.settlements.push(vertexId);
   pushLog(next, `${player.username} built a settlement.`);
@@ -782,6 +864,7 @@ function buildCity(state: RoomState, userId: string, vertexId: number): ActionRe
   }
 
   spendResources(player.resources, cost);
+  gainBankResources(next.resourceBank, cost);
   next.buildings[vertexId] = { ownerId: userId, kind: "city" };
   player.settlements = player.settlements.filter((id) => id !== vertexId);
   player.cities.push(vertexId);
@@ -805,6 +888,7 @@ function buyDevCard(state: RoomState, userId: string): ActionResult {
   if (!hasResources(player.resources, cost)) return { ok: false, state, error: "not enough resources" };
 
   spendResources(player.resources, cost);
+  gainBankResources(next.resourceBank, cost);
   const drawn = next.devDeck.shift() as DevCard;
   player.newDevCards[drawn] += 1;
   pushLog(next, `${player.username} bought a development card.`);
@@ -831,6 +915,8 @@ function playDevCard(state: RoomState, userId: string, card: DevCard, payload: a
   if (card === "knight") {
     nextPlayer.playedKnights += 1;
     updateLargestArmyHolder(next);
+    next.pendingRobber = true;
+    pushLog(next, `${nextPlayer.username} played Knight. ${nextPlayer.username} is robbing someone.`);
     const moved = moveRobber(next, userId, payload.tileId, payload.targetPlayerId);
     if (!moved.ok) return moved;
     moved.state.pendingRobber = false;
@@ -847,6 +933,12 @@ function playDevCard(state: RoomState, userId: string, card: DevCard, payload: a
       if (!["wood", "brick", "sheep", "wheat", "ore"].includes(resource)) {
         return { ok: false, state, error: "invalid resource" };
       }
+      if (!hasBankResources(next.resourceBank, { [resource]: 1 })) {
+        return { ok: false, state, error: `bank is out of ${resource}` };
+      }
+    }
+    for (const resource of resources) {
+      spendBankResources(next.resourceBank, { [resource]: 1 });
       nextPlayer.resources[resource] += 1;
     }
     pushLog(next, `${nextPlayer.username} played Year of Plenty.`);
@@ -890,25 +982,140 @@ function playDevCard(state: RoomState, userId: string, card: DevCard, payload: a
   return { ok: false, state, error: "cannot play this card" };
 }
 
-function maritimeTrade(state: RoomState, userId: string, giveResource: Resource, receiveResource: Resource): ActionResult {
+function maritimeTrade(state: RoomState, userId: string, give: Partial<ResourceBank>, receive: Partial<ResourceBank>): ActionResult {
   if (state.phase !== "main") return { ok: false, state, error: "not in main phase" };
   if (state.mustRoll) return { ok: false, state, error: "roll dice first" };
 
   const active = getActivePlayer(state);
   if (active.id !== userId) return { ok: false, state, error: "not your turn" };
 
-  const next = cloneState(state);
-  const player = getPlayer(next, userId) as PlayerState;
-  const rate = getPortRateForPlayer(next, player, giveResource);
+  let totalReceive = 0;
+  for (const res of Object.keys(receive) as Resource[]) {
+    const count = receive[res] || 0;
+    if (count < 0 || !Number.isInteger(count)) return { ok: false, state, error: "invalid receive quantity" };
+    totalReceive += count;
+  }
+  if (totalReceive <= 0) return { ok: false, state, error: "must receive at least 1 resource" };
 
-  if (player.resources[giveResource] < rate) {
-    return { ok: false, state, error: `need ${rate} ${giveResource} for trade` };
+  let totalTradeValue = 0;
+  for (const res of Object.keys(give) as Resource[]) {
+    const count = give[res] || 0;
+    if (count < 0 || !Number.isInteger(count)) return { ok: false, state, error: "invalid give quantity" };
+    if (count === 0) continue;
+    if ((receive[res] || 0) > 0) {
+      return { ok: false, state, error: "cannot trade resource for itself" };
+    }
   }
 
-  player.resources[giveResource] -= rate;
-  player.resources[receiveResource] += 1;
-  pushLog(next, `${player.username} traded ${rate} ${giveResource} for 1 ${receiveResource}.`);
+  const next = cloneState(state);
+  const player = getPlayer(next, userId) as PlayerState;
 
+  for (const res of Object.keys(give) as Resource[]) {
+    const count = give[res] || 0;
+    if (count === 0) continue;
+    const rate = getPortRateForPlayer(next, player, res);
+    if (count % rate !== 0) {
+      return { ok: false, state, error: `invalid trade quantity for ${res}, need multiples of ${rate}` };
+    }
+    totalTradeValue += count / rate;
+  }
+
+  if (totalTradeValue === 0) return { ok: false, state, error: "must give at least some resources" };
+  if (totalTradeValue !== totalReceive) {
+    return { ok: false, state, error: `trade values do not match: giving enough for ${totalTradeValue}, requesting ${totalReceive}` };
+  }
+
+  if (!hasResources(player.resources, give)) {
+    return { ok: false, state, error: "not enough resources to trade" };
+  }
+  if (!hasBankResources(next.resourceBank, receive)) {
+    return { ok: false, state, error: "bank does not have requested resources" };
+  }
+
+  spendResources(player.resources, give);
+  gainBankResources(next.resourceBank, give);
+
+  for (const res of Object.keys(receive) as Resource[]) {
+    gainResource(player.resources, res, receive[res] || 0);
+  }
+  spendBankResources(next.resourceBank, receive);
+
+  const giveStr = Object.keys(give).filter(r => (give[r as Resource]||0) > 0).map(r => `${give[r as Resource]} ${r}`).join(", ");
+  const recStr = Object.keys(receive).filter(r => (receive[r as Resource]||0) > 0).map(r => `${receive[r as Resource]} ${r}`).join(", ");
+  pushLog(next, `${player.username} traded ${giveStr} for ${recStr}.`);
+
+  return { ok: true, state: next };
+}
+
+function offerTrade(state: RoomState, userId: string, offer: Partial<ResourceBank>, request: Partial<ResourceBank>): ActionResult {
+  if (state.phase !== "main") return { ok: false, state, error: "not in main phase" };
+  if (state.mustRoll) return { ok: false, state, error: "roll dice first" };
+  if (state.pendingRobber || Object.keys(state.pendingDiscards).length > 0) return { ok: false, state, error: "resolve robber first" };
+
+  const active = getActivePlayer(state);
+  if (active.id !== userId) return { ok: false, state, error: "not your turn" };
+  
+  for (const resource of ["wood", "brick", "sheep", "wheat", "ore"] as Resource[]) {
+    if (offer[resource] && request[resource]) {
+      return { ok: false, state, error: "cannot request a trade that contains the same type of card" };
+    }
+  }
+
+  const next = cloneState(state);
+  const player = getPlayer(next, userId) as PlayerState;
+
+  if (!hasResources(player.resources, offer)) {
+    return { ok: false, state, error: "you do not have the resources to offer" };
+  }
+
+  next.pendingTrade = { authorId: userId, offer, request };
+  pushLog(next, `${player.username} offered a domestic trade.`);
+  return { ok: true, state: next };
+}
+
+function acceptTrade(state: RoomState, userId: string): ActionResult {
+  if (state.phase !== "main") return { ok: false, state, error: "not in main phase" };
+  const trade = state.pendingTrade;
+  if (!trade) return { ok: false, state, error: "no pending trade" };
+  if (trade.authorId === userId) return { ok: false, state, error: "cannot accept your own trade" };
+
+  const active = getActivePlayer(state);
+  if (active.id !== trade.authorId) return { ok: false, state, error: "active player changed" };
+
+  const next = cloneState(state);
+  const offerer = getPlayer(next, trade.authorId) as PlayerState;
+  const acceptor = getPlayer(next, userId) as PlayerState;
+
+  if (!hasResources(offerer.resources, trade.offer)) {
+    return { ok: false, state, error: "offerer no longer has the resources" };
+  }
+  if (!hasResources(acceptor.resources, trade.request)) {
+    return { ok: false, state, error: "you do not have the requested resources" };
+  }
+
+  spendResources(offerer.resources, trade.offer);
+  spendResources(acceptor.resources, trade.request);
+  
+  for (const resource of Object.keys(trade.offer) as Resource[]) {
+    gainResource(acceptor.resources, resource, trade.offer[resource] || 0);
+  }
+  for (const resource of Object.keys(trade.request) as Resource[]) {
+    gainResource(offerer.resources, resource, trade.request[resource] || 0);
+  }
+
+  next.pendingTrade = null;
+  pushLog(next, `${acceptor.username} accepted the trade with ${offerer.username}.`);
+  return { ok: true, state: next };
+}
+
+function cancelTrade(state: RoomState, userId: string): ActionResult {
+  if (!state.pendingTrade) return { ok: false, state, error: "no pending trade" };
+  if (state.pendingTrade.authorId !== userId) return { ok: false, state, error: "only the author can cancel the trade" };
+
+  const next = cloneState(state);
+  next.pendingTrade = null;
+  const player = getPlayer(next, userId) as PlayerState;
+  pushLog(next, `${player.username} cancelled their trade offer.`);
   return { ok: true, state: next };
 }
 
@@ -923,6 +1130,7 @@ function endTurn(state: RoomState, userId: string): ActionResult {
   }
 
   const next = cloneState(state);
+  next.pendingTrade = null;
   const player = getPlayer(next, userId) as PlayerState;
   pushLog(next, `${player.username} ended their turn.`);
   advanceTurn(next);
@@ -934,7 +1142,12 @@ function sanitizeStateForUser(state: RoomState, viewerUserId: string) {
   return {
     ...state,
     activePlayerId: active ? active.id : null,
+    devDeckCount: state.devDeck.length,
+    resourceBank: state.resourceBank,
     players: state.players.map((player) => {
+      const fullVP = getVictoryPoints(state, player.id);
+      const publicVP = getPublicVictoryPoints(state, player.id);
+
       const visible = {
         id: player.id,
         username: player.username,
@@ -942,14 +1155,17 @@ function sanitizeStateForUser(state: RoomState, viewerUserId: string) {
         settlements: player.settlements,
         cities: player.cities,
         playedKnights: player.playedKnights,
-        victoryPoints: getVictoryPoints(state, player.id),
+        publicVictoryPoints: publicVP,
       } as any;
 
       if (player.id === viewerUserId) {
+        // Owner sees full details
+        visible.victoryPoints = fullVP;
         visible.resources = player.resources;
         visible.devCards = player.devCards;
         visible.newDevCards = player.newDevCards;
       } else {
+        // Others only see counts, not private resources/devcards
         visible.resourceCount = sumResources(player.resources);
         visible.devCardCount = sumDevCards(player.devCards) + sumDevCards(player.newDevCards);
       }
@@ -999,7 +1215,16 @@ function applyGameAction(state: RoomState, userId: string, action: any): ActionR
     return playDevCard(state, userId, action.card, action.payload || {});
   }
   if (actionType === "maritime_trade") {
-    return maritimeTrade(state, userId, action.giveResource, action.receiveResource);
+    return maritimeTrade(state, userId, action.give || {}, action.receive || {});
+  }
+  if (actionType === "offer_trade") {
+    return offerTrade(state, userId, action.offer || {}, action.request || {});
+  }
+  if (actionType === "accept_trade") {
+    return acceptTrade(state, userId);
+  }
+  if (actionType === "cancel_trade") {
+    return cancelTrade(state, userId);
   }
   if (actionType === "end_turn") {
     return endTurn(state, userId);
@@ -1027,12 +1252,14 @@ function resetPlayersForLobby(state: RoomState): void {
   state.pendingDiscards = {};
   state.pendingRobber = false;
   state.pendingSetupPlacement = null;
+  state.pendingTrade = null;
   state.longestRoadHolder = null;
   state.largestArmyHolder = null;
   state.winnerId = null;
   state.buildings = {};
   state.roads = {};
   state.devDeck = [];
+  state.resourceBank = fullResourceBank();
 }
 
 module.exports = {
